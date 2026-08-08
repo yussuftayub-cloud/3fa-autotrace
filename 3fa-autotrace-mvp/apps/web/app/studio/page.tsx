@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 
-const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API = "https://threefa-autotrace-api.onrender.com";
 
 export default function Studio() {
   const [file, setFile] = useState<File | null>(null);

@@ -283,15 +283,15 @@ def trace_image(data: bytes):
 
     for contour in contours:
 
-        perimeter = cv2.arcLength(
-            contour,
-            True
-        )
+perimeter = cv2.arcLength(
+    contour,
+    True
+)
 
-        # Larger epsilon = fewer nodes
-        epsilon = max(
-            1.2,
-            perimeter * 0.0025
+epsilon = max(
+    0.5,
+    perimeter * 0.001
+)
         )
 
         simplified = cv2.approxPolyDP(

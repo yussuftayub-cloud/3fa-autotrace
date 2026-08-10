@@ -1,416 +1,328 @@
+"""
+3FA AUTO TRACE - Vector Engine V2
+Drop-in replacement for apps/api/app/tracer.py
+
+Uses OpenCV only:
+- 4x internal supersampling
+- transparency/white-background handling
+- Otsu + adaptive + edge masks
+- morphology for clean logo shapes
+- connected-component filtering
+- conservative contour simplification
+- curve-aware SVG paths
+- EPS export
+"""
+
+from __future__ import annotations
 import base64
-import io
+import math
+from typing import Any, Dict, List
+
 import cv2
 import numpy as np
-from PIL import Image
 
 
-# ============================================================
-# 3FA AUTO TRACE V2
-# Smooth Bézier vector tracing
-# ============================================================
-
-def angle_between(a, b, c):
-    """
-    Return turning angle at point b.
-    """
-    v1 = a.astype(float) - b.astype(float)
-    v2 = c.astype(float) - b.astype(float)
-
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-
-    if n1 == 0 or n2 == 0:
-        return 180.0
-
-    cosang = np.dot(v1, v2) / (n1 * n2)
-    cosang = np.clip(cosang, -1.0, 1.0)
-
-    return np.degrees(np.arccos(cosang))
+SCALE = 4.0
+MIN_AREA_REL = 0.000035
 
 
-def bezier_path(points, corner_angle=55.0, tension=0.32):
-    """
-    Convert a closed polygon into a smooth Bézier path.
+def _decode(data: bytes) -> np.ndarray:
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("Imej tidak dapat dibaca.")
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
+    elif img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2BGRA)
+    return img
 
-    Sharp corners remain mostly straight.
-    Curved sections receive smooth cubic Bézier handles.
-    """
 
-    pts = np.asarray(points, dtype=float)
+def _composite_white(img: np.ndarray) -> np.ndarray:
+    bgr = img[:, :, :3].astype(np.float32)
+    alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+    out = bgr * alpha + 255.0 * (1.0 - alpha)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
-    if len(pts) < 3:
-        return ""
 
-    # Remove duplicate neighbouring points
-    clean = [pts[0]]
+def _upscale(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    return cv2.resize(
+        img,
+        (max(32, int(w * SCALE)), max(32, int(h * SCALE))),
+        interpolation=cv2.INTER_LANCZOS4,
+    )
 
-    for p in pts[1:]:
-        if np.linalg.norm(p - clean[-1]) > 1.0:
-            clean.append(p)
 
-    pts = np.asarray(clean)
+def _candidate_masks(img: np.ndarray) -> List[np.ndarray]:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    if len(pts) < 3:
-        return ""
+    clahe = cv2.createCLAHE(2.0, (8, 8))
+    gray = clahe.apply(gray)
 
-    n = len(pts)
+    _, otsu = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
 
-    commands = []
+    adaptive = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 7
+    )
 
-    # Start
-    p0 = pts[0]
-    commands.append(f"M {p0[0]:.2f} {p0[1]:.2f}")
+    edge = cv2.Canny(gray, 45, 130)
+    edge = cv2.morphologyEx(
+        edge, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=2
+    )
+    edge = cv2.dilate(edge, np.ones((3, 3), np.uint8), iterations=1)
 
-    for i in range(n):
-        prev = pts[(i - 1) % n]
-        curr = pts[i]
-        nxt = pts[(i + 1) % n]
-
-        # Detect sharp corner
-        angle = angle_between(prev, curr, nxt)
-
-        p_prev = prev
-        p_curr = curr
-        p_next = nxt
-
-        d1 = np.linalg.norm(p_curr - p_prev)
-        d2 = np.linalg.norm(p_next - p_curr)
-
-        if d1 < 0.001 or d2 < 0.001:
-            continue
-
-        # Sharp corner:
-        # use straight line instead of aggressively rounding it.
-        if angle < corner_angle:
-            commands.append(
-                f"L {p_curr[0]:.2f} {p_curr[1]:.2f}"
-            )
-            continue
-
-        # Smooth Bézier handles
-        incoming = p_curr - (p_curr - p_prev) * tension
-        outgoing = p_curr + (p_next - p_curr) * tension
-
-        # Previous segment control point
-        prev_control = p_curr - (p_next - p_prev) * tension
-
-        # Next segment control point
-        next_control = p_curr + (p_next - p_prev) * tension
-
-        if i == 0:
-            continue
-
-        commands.append(
-            f"C "
-            f"{prev_control[0]:.2f} {prev_control[1]:.2f}, "
-            f"{next_control[0]:.2f} {next_control[1]:.2f}, "
-            f"{p_curr[0]:.2f} {p_curr[1]:.2f}"
+    result = []
+    for mask in (otsu, adaptive, edge):
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)
         )
-
-    commands.append("Z")
-
-    return " ".join(commands)
-
-
-def eps_path(points, height, corner_angle=55.0, tension=0.32):
-    """
-    Convert Bézier SVG-style geometry into EPS commands.
-    """
-
-    pts = np.asarray(points, dtype=float)
-
-    if len(pts) < 3:
-        return ""
-
-    clean = [pts[0]]
-
-    for p in pts[1:]:
-        if np.linalg.norm(p - clean[-1]) > 1.0:
-            clean.append(p)
-
-    pts = np.asarray(clean)
-
-    if len(pts) < 3:
-        return ""
-
-    n = len(pts)
-
-    p0 = pts[0]
-
-    commands = [
-        f"{p0[0]:.2f} {height - p0[1]:.2f} moveto"
-    ]
-
-    for i in range(1, n):
-        prev = pts[(i - 1) % n]
-        curr = pts[i]
-        nxt = pts[(i + 1) % n]
-
-        angle = angle_between(prev, curr, nxt)
-
-        if angle < corner_angle:
-            commands.append(
-                f"{curr[0]:.2f} {height - curr[1]:.2f} lineto"
-            )
-            continue
-
-        control1 = curr - (nxt - prev) * tension
-        control2 = curr + (nxt - prev) * tension
-
-        commands.append(
-            f"{control1[0]:.2f} {height - control1[1]:.2f} "
-            f"{control2[0]:.2f} {height - control2[1]:.2f} "
-            f"{curr[0]:.2f} {height - curr[1]:.2f} curveto"
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
         )
-
-    commands.append("closepath")
-
-    return "\n".join(commands)
+        result.append(mask)
+    return result
 
 
-def trace_image(data: bytes):
-
-    try:
-        image = Image.open(
-            io.BytesIO(data)
-        ).convert("RGBA")
-
-    except Exception as exc:
-        raise ValueError(
-            f"Fail imej tidak sah: {exc}"
-        )
-
-    rgba = np.array(image)
-
-    rgb = cv2.cvtColor(
-        rgba,
-        cv2.COLOR_RGBA2RGB
-    )
-
-    gray = cv2.cvtColor(
-        rgb,
-        cv2.COLOR_RGB2GRAY
-    )
-
-    # ========================================================
-    # 1. UPSCALE
-    # ========================================================
-
-    scale = 2
-
-    gray = cv2.resize(
-        gray,
-        None,
-        fx=scale,
-        fy=scale,
-        interpolation=cv2.INTER_CUBIC
-    )
-
-    # ========================================================
-    # 2. CLEAN IMAGE
-    # ========================================================
-
-    gray = cv2.GaussianBlur(
-        gray,
-        (5, 5),
-        0
-    )
-
-    # ========================================================
-    # 3. AUTO THRESHOLD
-    # ========================================================
-
-    _, mask = cv2.threshold(
-        gray,
-        0,
-        255,
-        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-
-    # ========================================================
-    # 4. MORPHOLOGICAL CLEANUP
-    # ========================================================
-
-    kernel = np.ones(
-        (3, 3),
-        np.uint8
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=1
-    )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel,
-        iterations=1
-    )
-
-    # ========================================================
-    # 5. FIND CONTOURS
-    # ========================================================
-
+def _score(mask: np.ndarray) -> float:
+    h, w = mask.shape
+    area = float(h * w)
     contours, _ = cv2.findContours(
-        mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_NONE
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+    good = [c for c in contours if cv2.contourArea(c) > area * MIN_AREA_REL]
+    if not good:
+        return -1e9
 
-    # Ignore tiny noise
-    contours = [
-        c for c in contours
-        if cv2.contourArea(c) >= 25
-    ]
+    fill = sum(cv2.contourArea(c) for c in good) / area
+    if fill > 0.92:
+        return -1e6
 
-    contours.sort(
-        key=cv2.contourArea,
-        reverse=True
-    )
+    return 3.0 * (1.0 - abs(fill - 0.22)) + min(len(good), 12) / 12.0
 
-    # Safety limit
-    contours = contours[:300]
 
-    # ========================================================
-    # 6. REDUCE NODES
-    # ========================================================
+def _best_mask(masks: List[np.ndarray]) -> np.ndarray:
+    return max(masks, key=_score)
 
-    smooth_contours = []
 
-    for contour in contours:
+def _clean_components(mask: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    min_area = h * w * MIN_AREA_REL
 
-perimeter = cv2.arcLength(
-    contour,
-    True
-)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    clean = np.zeros_like(mask)
 
-epsilon = max(
-    0.5,
-    perimeter * 0.001
-)
-        )
+    for label in range(1, n):
+        if stats[label, cv2.CC_STAT_AREA] >= min_area:
+            clean[labels == label] = 255
 
-        simplified = cv2.approxPolyDP(
-            contour,
-            epsilon,
-            True
-        )
+    return clean
 
-        if len(simplified) >= 3:
-            smooth_contours.append(
-                simplified
+
+def _simplify(c: np.ndarray) -> np.ndarray:
+    if len(c) < 6:
+        return c
+
+    p = cv2.arcLength(c, True)
+
+    # Very conservative reduction: preserve logo corners and curves.
+    a = max(0.30, p * 0.00030)
+    c1 = cv2.approxPolyDP(c, a, True)
+
+    p2 = cv2.arcLength(c1, True)
+    a2 = max(0.40, p2 * 0.00055)
+    c2 = cv2.approxPolyDP(c1, a2, True)
+
+    return c2 if len(c2) >= 3 else c1
+
+
+def _fmt(v: float) -> str:
+    if abs(v) < 0.0001:
+        v = 0.0
+    return f"{v:.2f}"
+
+
+def _path(points: np.ndarray) -> str:
+    pts = points.reshape(-1, 2).astype(float)
+    if len(pts) < 3:
+        return ""
+
+    # Keep sharp corners; use quadratic curves on gentle sections.
+    out = [f"M {_fmt(pts[0,0])} {_fmt(pts[0,1])}"]
+    n = len(pts)
+
+    for i in range(1, n + 1):
+        prev = pts[(i - 1) % n]
+        cur = pts[i % n]
+        nxt = pts[(i + 1) % n]
+
+        a = prev - cur
+        b = nxt - cur
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+
+        sharp = False
+        if na > 1e-6 and nb > 1e-6:
+            angle = math.degrees(
+                math.acos(np.clip(np.dot(a, b) / (na * nb), -1, 1))
+            )
+            sharp = angle < 125
+
+        if sharp:
+            out.append(f"L {_fmt(cur[0])} {_fmt(cur[1])}")
+        else:
+            mid = (cur + nxt) / 2.0
+            out.append(
+                f"Q {_fmt(cur[0])} {_fmt(cur[1])} "
+                f"{_fmt(mid[0])} {_fmt(mid[1])}"
             )
 
-    height, width = gray.shape
+    out.append("Z")
+    return " ".join(out)
 
-    # ========================================================
-    # 7. SVG
-    # ========================================================
 
-    svg_paths = []
+def _scale_path(path: str, scale: float) -> str:
+    t = path.split()
+    out = []
+    i = 0
 
-    for contour in smooth_contours:
+    while i < len(t):
+        cmd = t[i]
+        out.append(cmd)
 
-        points = contour.reshape(
-            -1,
-            2
-        )
+        if cmd in ("M", "L"):
+            out += [_fmt(float(t[i+1]) * scale),
+                    _fmt(float(t[i+2]) * scale)]
+            i += 3
+        elif cmd == "Q":
+            out += [_fmt(float(t[i+1]) * scale),
+                    _fmt(float(t[i+2]) * scale),
+                    _fmt(float(t[i+3]) * scale),
+                    _fmt(float(t[i+4]) * scale)]
+            i += 5
+        else:
+            i += 1
 
-        path = bezier_path(
-            points,
-            corner_angle=55.0,
-            tension=0.28
-        )
+    return " ".join(out)
 
-        if path:
-            svg_paths.append(
-                f'<path d="{path}"/>'
-            )
 
-    svg = f'''<svg
-xmlns="http://www.w3.org/2000/svg"
-width="{width}"
-height="{height}"
-viewBox="0 0 {width} {height}">
-
-<g
-fill="black"
-fill-rule="evenodd"
-stroke="none">
-
-{"".join(svg_paths)}
-
-</g>
-</svg>'''
-
-    # ========================================================
-    # 8. EPS
-    # ========================================================
-
-    eps_lines = [
+def _eps_from_paths(paths: List[str], width: int, height: int) -> bytes:
+    # EPS uses the same vector geometry. Quadratic SVG segments are
+    # represented as short line segments for maximum compatibility.
+    lines = [
         "%!PS-Adobe-3.0 EPSF-3.0",
         f"%%BoundingBox: 0 0 {width} {height}",
-        "%%Creator: 3FA AUTO TRACE V2",
-        "%%Title: Smooth Bézier Vector",
-        "%%EndComments",
+        "%%Creator: 3FA AUTO TRACE Vector Engine V2",
+        "1 setlinejoin",
+        "1 setlinecap",
         "0 0 0 setrgbcolor",
     ]
 
-    for contour in smooth_contours:
+    for p in paths:
+        tokens = p.split()
+        i = 0
+        while i < len(tokens):
+            cmd = tokens[i]
 
-        points = contour.reshape(
-            -1,
-            2
-        )
+            if cmd in ("M", "L"):
+                x = float(tokens[i+1])
+                y = height - float(tokens[i+2])
+                lines.append(
+                    f"{x:.2f} {y:.2f} "
+                    + ("moveto" if cmd == "M" else "lineto")
+                )
+                i += 3
+            elif cmd == "Q":
+                # Conservative EPS fallback: line to curve midpoint/end.
+                x = float(tokens[i+3])
+                y = height - float(tokens[i+4])
+                lines.append(f"{x:.2f} {y:.2f} lineto")
+                i += 5
+            elif cmd == "Z":
+                lines.append("closepath fill")
+                i += 1
+            else:
+                i += 1
 
-        path = eps_path(
-            points,
-            height,
-            corner_angle=55.0,
-            tension=0.28
-        )
+    lines.append("showpage")
+    lines.append("%%EOF")
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
-        if path:
-            eps_lines.append(path)
 
-    eps_lines.extend([
-        "fill",
-        "showpage",
-        "%%EOF"
-    ])
+def trace_image(data: bytes) -> Dict[str, Any]:
+    original = _decode(data)
+    source_h, source_w = original.shape[:2]
 
-    eps = "\n".join(
-        eps_lines
+    if source_w < 2 or source_h < 2:
+        raise ValueError("Saiz imej tidak sah.")
+
+    work = _upscale(_composite_white(original))
+    mask = _best_mask(_candidate_masks(work))
+    mask = _clean_components(mask)
+
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
     )
 
-    # ========================================================
-    # 9. QUALITY SCORE
-    # ========================================================
+    canvas_area = mask.shape[0] * mask.shape[1]
+    contours = [
+        c for c in contours
+        if cv2.contourArea(c) >= canvas_area * MIN_AREA_REL
+    ]
 
-    total_paths = len(svg_paths)
-
-    quality = min(
-        98,
-        max(
-            80,
-            int(
-                90 +
-                min(total_paths, 80) / 10
-            )
+    if not contours:
+        raise ValueError(
+            "Trace gagal. Cuba imej dengan latar lebih jelas/kontras."
         )
-    )
+
+    paths = []
+    for c in contours:
+        # Convert from internal 4x coordinates back to source coordinates.
+        pts = c.astype(np.float32) / SCALE
+        p = _path(_simplify(pts))
+        if p:
+            paths.append(_scale_path(p, 4.0))
+
+    if not paths:
+        raise ValueError("Trace gagal menghasilkan vector path.")
+
+    out_w = int(source_w * 4)
+    out_h = int(source_h * 4)
+
+    svg = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{out_w}" height="{out_h}" '
+        f'viewBox="0 0 {out_w} {out_h}">',
+        '<g fill="#000000" fill-rule="evenodd">'
+    ]
+    svg.extend(f'<path d="{p}"/>' for p in paths)
+    svg.extend(["</g>", "</svg>"])
+    svg_text = "\n".join(svg)
+
+    eps = _eps_from_paths(paths, out_w, out_h)
+    eps_b64 = base64.b64encode(eps).decode("ascii")
+
+    # Quality is a diagnostic score, not a claim of true source resolution.
+    quality = 88
+    if source_w * source_h < 150_000:
+        quality -= 5
+    if len(contours) > 40:
+        quality -= 8
+    quality = max(1, min(99, quality))
 
     return {
-        "width": width,
-        "height": height,
-        "contours": total_paths,
+        "width": out_w,
+        "height": out_h,
+        "source_width": source_w,
+        "source_height": source_h,
+        "contours": len(contours),
+        "paths": len(paths),
         "quality": quality,
-        "svg": svg,
-        "eps_base64": base64.b64encode(
-            eps.encode()
-        ).decode(),
+        "svg": svg_text,
+        "eps_base64": eps_b64,
+        "engine": "3FA Vector Engine V2",
     }
